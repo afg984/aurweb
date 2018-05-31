@@ -20,6 +20,14 @@ class AurJSON {
 		'name', 'name-desc', 'maintainer',
 		'depends', 'makedepends', 'checkdepends', 'optdepends'
 	);
+	private static $exposed_fields_v6 = array(
+		'name', 'description', 'maintainer', 'provides',
+	);
+	private static $exposed_fields_map_v6 = array(
+		'name' => 'Packages.Name',
+		'description' => 'Packages.Description',
+		'maintainer' => 'Packages.Maintainer',
+	);
 	private static $exposed_depfields = array(
 		'depends', 'makedepends', 'checkdepends', 'optdepends'
 	);
@@ -80,7 +88,7 @@ class AurJSON {
 		if (isset($http_data['v'])) {
 			$this->version = intval($http_data['v']);
 		}
-		if ($this->version < 1 || $this->version > 5) {
+		if ($this->version < 1 || $this->version > 6) {
 			return $this->json_error('Invalid version specified.');
 		}
 
@@ -94,8 +102,21 @@ class AurJSON {
 		if (isset($http_data['search_by']) && !isset($http_data['by'])) {
 			$http_data['by'] = $http_data['search_by'];
 		}
-		if (isset($http_data['by']) && !in_array($http_data['by'], self::$exposed_fields)) {
-			return $this->json_error('Incorrect by field specified.');
+		if (isset($http_data['by'])) {
+			if ($this->version < 6) {
+				if (!in_array($http_data['by'], self::$exposed_fields)) {
+					return $this->json_error('Incorrect by field specified.');
+				}
+			} else {
+				if (!is_array($http_data['by'])) {
+					$http_data['by'] = array($http_data['by']);
+				}
+				foreach ($http_data['by'] as $by) {
+					if (!in_array($by, self::$exposed_fields_v6)) {
+						return $this->json_error("Incorrect by field '$by' specified.");
+					}
+				}
+			}
 		}
 
 		$this->dbh = DB::connect();
@@ -109,7 +130,11 @@ class AurJSON {
 		if ($type == 'info' && $this->version >= 5) {
 			$type = 'multiinfo';
 		}
-		$json = call_user_func(array(&$this, $type), $http_data);
+		if ($this->version < 6) {
+			$json = call_user_func(array(&$this, $type), $http_data);
+		} else {
+			$json = $this->info_search_v6($type, $http_data);
+		}
 
 		$etag = md5($json);
 		header("Etag: \"$etag\"");
@@ -374,6 +399,21 @@ class AurJSON {
 		}
 		$result = $this->dbh->query($query);
 
+		return $this->process_result($type, $result);
+	}
+
+
+	/*
+	 * Retrieve package information from a dbh->query result
+	 *
+	 * @param $type The request type.
+	 * @param $result A dbh->query result.
+	 *
+	 * @return mixed Returns an array of package matches.
+	 */
+	private function process_result($type, $result) {
+		$max_results = config_get_int('options', 'max_rpc_results');
+
 		if ($result) {
 			$resultcount = 0;
 			$search_data = array();
@@ -513,6 +553,84 @@ class AurJSON {
 		}
 
 		return $this->process_query('search', $where_condition);
+	}
+
+
+
+	/*
+	 * Performs a info or search query to the package database.
+	 *
+	 * @param $type The request type.
+	 * @param array $http_data Query parameters.
+	 *
+	 * @return mixed Returns an array of package matches.
+	 */
+	private function info_search_v6($type, $http_data) {
+		if (isset($http_data['by'])) {
+			$query_by = $http_data['by'];
+			if (!is_array($query_by)) {
+				$query_by = array($query_by);
+			}
+		} else {
+			if ($type == "multiinfo") {
+				$query_by = array('name');
+			} else { // search
+				$query_by = array('name', 'description');
+			}
+		}
+
+		if ($type == "multiinfo") {
+			$args = $http_data['arg'];
+			if (!is_array($args)) {
+				$args = array($args);
+			}
+			foreach ($args as $i => $arg) {
+				$args[$i] = $this->dbh->quote($arg);
+			}
+			$op_rhs = " IN (" . implode(",", $args) . ")";
+		} else {
+			$keyword_string = $http_data['arg'];
+			$keyword_string = $this->dbh->quote("%" . addcslashes($keyword_string, '%_') . "%");
+			$op_rhs = " LIKE " . $keyword_string;
+		}
+
+		$has_provides_query = false;
+		$where_condition = "";
+		foreach ($query_by as $index => $by) {
+			if ($index != 0) {
+				$where_condition .= " OR ";
+			}
+			if ($by == "provides") {
+				$has_provides_query = true;
+				$where_condition .= "(RelationTypes.Name = 'provides' AND ";
+				$where_condition .= "PackageRelations.RelName $op_rhs)";
+			} else {
+				$where_condition .= self::$exposed_fields_map_v6[$by];
+				$where_condition .= $op_rhs;
+			}
+		}
+
+		$max_results = config_get_int('options', 'max_rpc_results');
+		$fields = implode(',', self::$fields_v4);
+		$q = "SELECT {$fields} " .
+			"FROM Packages LEFT JOIN PackageBases " .
+			"ON PackageBases.ID = Packages.PackageBaseID " .
+			"LEFT JOIN Users " .
+			"ON PackageBases.MaintainerUID = Users.ID ";
+		if ($has_provides_query) {
+			$q .= "LEFT JOIN PackageRelations ON PackageRelations.PackageID = Packages.ID ";
+			$q .= "LEFT JOIN RelationTypes ON RelationTypes.ID = PackageRelations.RelTypeID ";
+		}
+		$q .= "WHERE ${where_condition} ";
+		$q .= "AND PackageBases.PackagerUID IS NOT NULL ";
+		if ($has_provides_query) {
+			$q .= "GROUP BY Packages.ID ";
+		}
+		$q .= "LIMIT $max_results";
+
+		$result = $this->dbh->query($q);
+
+		return $this->process_result($type, $result);
 	}
 
 	/*
@@ -680,4 +798,3 @@ class AurJSON {
 		return json_encode($output);
 	}
 }
-
